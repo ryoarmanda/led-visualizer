@@ -4,15 +4,15 @@
 // --- Macros ---
 
 /* FFT Essentials */
-#define AUDIO_IN        15
-#define SAMPLES         512  // power of 2
-#define SAMPLING_RATE   5000 // Hz
-#define REFRESH_INTERVAL 500000
+#define AUDIO_IN         15
+#define SAMPLES          512    // power of 2
+#define SAMPLING_RATE    10000   // Hz
+#define REFRESH_INTERVAL 0  // microseconds
 
 /* FFT Additionals */
 #define FREQ_PER_BIN round(SAMPLING_RATE * (1.0 / SAMPLES))
-#define LOWER_BOUND  100.0
-#define UPPER_BOUND  5000.0
+#define LOWER_BOUND_MAG 100.0
+#define LOWER_BOUND_DB  -20.0
 
 /* Frequency Breakpoints */
 #define FREQ_START     150  // Hz
@@ -32,7 +32,7 @@
 #define LED_TYPE           WS2812B
 #define COLOR_TYPE         GRB
 #define NUM_STRIPS         1
-#define NUM_LEDS_PER_STRIP 150
+#define NUM_LEDS_PER_STRIP 75
 #define NUM_LEDS           NUM_STRIPS * NUM_LEDS_PER_STRIP
 
 /* Animation Settings */
@@ -40,8 +40,8 @@
 #define ANIMATION_DELAY 25 // milliseconds
 
 /* Color Settings */
-#define BASE_BRIGHTNESS 15  // out of 256
-#define PEAK_BRIGHTNESS 128 // out of 256
+#define BASE_BRIGHTNESS 10  // out of 256
+#define PEAK_BRIGHTNESS 64 // out of 256
 #define COLOR_START     CHSV(25, 221, 255)
 #define COLOR_BASS      CHSV(0, 247, 255)
 #define COLOR_MID       CHSV(208, 214, 255)
@@ -49,40 +49,53 @@
 #define COLOR_END       CHSV(0, 0, 255)
 
 /* Utilities */
-#define ONE_SECOND    1000000
-#define WAVE_AMP      256
-#define DEBUG_MAGS    false
-#define DEBUG_FACTORS false
+#define ONE_SECOND  1000000
+#define WAVE_AMP    256
+
+#define DEBUG_MAG          true
+#define DEBUG_POWER        false
+#define DEBUG_DB           false
+#define DEBUG_PROCESS_TIME false
+#define DEBUG_CYCLE_TIME   false
 
 // --- Global Variables ---
 
+/* General */
+unsigned long refreshTime;    // microseconds
+
+/* Audio */
 unsigned long samplingPeriod; // microseconds
 unsigned long samplingTime;   // microseconds
-unsigned long refreshTime;    // microseconds
 double vReal[SAMPLES];
 double vImag[SAMPLES];
 arduinoFFT fft = arduinoFFT(vReal, vImag, SAMPLES, SAMPLING_RATE);
-CRGB colors[NUM_LEDS];
-double mags[NUM_LEDS];
-double peakMag;
+double powers[NUM_LEDS];
+double maxPower;
+
+/* Processing */
 double multipliers[ANIMATION_STEPS];
 double factors[NUM_LEDS];
+
+/* LED */
+CRGB colors[NUM_LEDS];
 CRGB leds[NUM_LEDS];
-double luma;
+int luma;
 
 void setup() {
   Serial.begin(115200);
-  
+
+  // FFT Setup
   samplingPeriod = round(ONE_SECOND * (1.0 / SAMPLING_RATE));
 
+  // LED Setup
   FastLED.addLeds<NUM_STRIPS, LED_TYPE, DATA_OUT, COLOR_TYPE>(leds, NUM_LEDS_PER_STRIP);
-  FastLED.clear();
+  FastLED.setMaxPowerInVoltsAndMilliamps(5, 9000);
+  for (int i = 0; i < NUM_LEDS; i++) {
+    colors[NUM_LEDS - i - 1] = getColorByBin(idx2bin(i));
+  }
   FastLED.show();
 
-  for (int i = 0; i < NUM_LEDS; i++) {
-    colors[i] = getColorByBin(idx2bin(i));
-  }
-
+  // Animation Setup
   for (int i = 0; i < ANIMATION_STEPS; i++) {
     multipliers[i] = cubicwave8(round(i * WAVE_AMP * (1.0 / ANIMATION_STEPS))) * (1.0 / WAVE_AMP);
   }
@@ -91,7 +104,7 @@ void setup() {
 void loop() {
   refreshTime = micros();
   
-  /* INPUT */
+  /* Input */
   for (int i = 0; i < SAMPLES; i++) {
     samplingTime = micros();
 
@@ -102,65 +115,82 @@ void loop() {
   }
 
   /* FFT */
-  fft.Windowing(FFT_WIN_TYP_HAMMING, FFT_FORWARD);
+  dcRemoval();
+  fft.Windowing(FFT_WIN_TYP_HANN, FFT_FORWARD);
   fft.Compute(FFT_FORWARD);
   fft.ComplexToMagnitude();
 
-  /* PREPROCESSING */
-  for (int i = 0; i < NUM_LEDS; i++) {
-    mags[i] = 0;
+  if (DEBUG_MAG) {
+    int whitespaceWidth = (500 - (BIN_END - BIN_START + 1)) / 2;
+    for (int i = 0; i < 500; i++) {
+      Serial.print(LOWER_BOUND_MAG);
+      Serial.print(" ");
+      if (i < whitespaceWidth || i >= whitespaceWidth + (BIN_END - BIN_START + 1)) {
+        Serial.println(0);
+      } else {
+        Serial.println(vReal[i - whitespaceWidth + BIN_START]);
+      }
+    }
   }
 
+  filterMagnitude();
+  magnitudeToPower();
+  
+  if (DEBUG_POWER) {
+    int whitespaceWidth = (500 - (BIN_END - BIN_START + 1)) / 2;
+    for (int i = 0; i < 500; i++) {
+      if (i < whitespaceWidth || i >= whitespaceWidth + (BIN_END - BIN_START + 1)) {
+        Serial.println(0);
+      } else {
+        Serial.println(vReal[i - whitespaceWidth + BIN_START]);
+      }
+    }
+  }
+
+  /* Processing */
+  memset(powers, 0, sizeof(powers));
+  memset(factors, 0, sizeof(factors));
+
+  // Combine powers
   for (int i = BIN_START; i <= BIN_END; i++) {
     for (int j = bin2idx(i); j < min(bin2idx(i + 1), NUM_LEDS); j++) {
-      mags[j] += vReal[i];
+      powers[j] += vReal[i];
     }
   }
 
-  peakMag = 0;
+  // Find max power
+  maxPower = 0;
   for (int i = 0; i < NUM_LEDS; i++) {
-    if (mags[i] > peakMag) {
-      peakMag = mags[i];
+    if (powers[i] > maxPower) {
+      maxPower = powers[i];
     }
   }
 
-  if (DEBUG_MAGS) {
-    for (int i = 0; i < 500; i++) {
-      Serial.print(LOWER_BOUND);
-      Serial.print(" ");
-      Serial.print(UPPER_BOUND);
-      Serial.print(" ");
-      if (i < 175 || i >= 175 + NUM_LEDS) {
-        Serial.println(0);
-      } else {
-        Serial.println(mags[i - 175]);
+  if (maxPower > 0) {
+    powerToDecibel();
+    if (DEBUG_DB) {
+      int whitespaceWidth = (500 - NUM_LEDS) / 2;
+      for (int i = 0; i < 500; i++) {
+        Serial.print(LOWER_BOUND_DB);
+        Serial.print(" ");
+        if (i < whitespaceWidth || i >= whitespaceWidth + NUM_LEDS) {
+          Serial.println(-50);
+        } else {
+          Serial.println(powers[i - whitespaceWidth]);
+        }
       }
     }
+    filterDecibel();
+    computeFactors();
   }
 
-  for (int i = 0; i < NUM_LEDS; i++) {
-    factors[i] = 0;
-    if (mags[i] > peakMag) {
-      factors[i] = 1;
-    } else if (mags[i] > LOWER_BOUND) {
-      factors[i] = (mags[i] - LOWER_BOUND) / (peakMag - LOWER_BOUND);
-//      factors[i] = log(mags[i] - LOWER_BOUND + 1) / log(UPPER_BOUND - LOWER_BOUND + 1);
-    }
+  if (DEBUG_PROCESS_TIME) {
+    Serial.print("Process time: ");
+    Serial.print(micros() - refreshTime);
+    Serial.println("us");
   }
-
-  if (DEBUG_FACTORS) {
-    for (int i = 0; i < 500; i++) {
-      Serial.print(100);
-      Serial.print(" ");
-      if (i < 175 || i >= 175 + NUM_LEDS) {
-        Serial.println(0);
-      } else {
-        Serial.println(factors[i - 175] * 100);
-      }
-    }
-  }
-
-  /* LED */
+  
+  /* LED Animation */
   for (int k = 0; k < ANIMATION_STEPS; k++) {    
     for (int i = 0; i < NUM_LEDS; i++) {
       luma = BASE_BRIGHTNESS + round((PEAK_BRIGHTNESS - BASE_BRIGHTNESS) * factors[i] * multipliers[k]);
@@ -174,7 +204,62 @@ void loop() {
     }
   }
 
+  if (DEBUG_CYCLE_TIME) {
+    Serial.print("Cycle time: ");
+    Serial.print(micros() - refreshTime);
+    Serial.println("us");
+  }
+
   while (micros() - refreshTime < REFRESH_INTERVAL) {}
+}
+
+void dcRemoval() {
+  double vMean = 0;
+  for (int i = 0; i < SAMPLES; i++) {
+    vMean += vReal[i];
+  }
+  vMean /= SAMPLES;
+  for (int i = 0; i < SAMPLES; i++) {
+    vReal[i] -= vMean;
+  }
+}
+
+void filterMagnitude() {
+  for (int i = 0; i < SAMPLES; i++) {
+    if (vReal[i] < LOWER_BOUND_MAG) {
+      vReal[i] = 0;
+    }
+  }
+}
+
+void magnitudeToPower() {
+  for (int i = 0; i < SAMPLES; i++) {
+    vReal[i] = sq(vReal[i]);
+  }
+}
+
+void powerToDecibel() {
+  for (int i = 0; i < NUM_LEDS; i++) {
+    if (powers[i] > 0) {
+      powers[i] = 10 * log10(powers[i] / maxPower);
+    } else {
+      powers[i] = LOWER_BOUND_DB;
+    }
+  }
+}
+
+void filterDecibel() {
+  for (int i = 0; i < NUM_LEDS; i++) {
+    if (powers[i] < LOWER_BOUND_DB) {
+      powers[i] = LOWER_BOUND_DB;
+    }
+  }
+}
+
+void computeFactors() {
+  for (int i = 0; i < NUM_LEDS; i++) {
+    factors[i] = (powers[i] - LOWER_BOUND_DB) / (-LOWER_BOUND_DB);
+  }
 }
 
 int transition(int from, int to, double factor) {
@@ -209,12 +294,10 @@ CRGB getColorByBin(int bin) {
   } else {
     return CRGB::Black;
   }
-
-  return CRGB::Black;
 }
 
 int bin2idx(int bin) {
-  return floor((NUM_LEDS - 1) * (log(bin - BIN_START + 1) / log(BIN_END - BIN_START + 1)));
+  return round((NUM_LEDS - 1) * (log(bin - BIN_START + 1) / log(BIN_END - BIN_START + 1)));
 }
 
 int idx2bin(int idx) {
