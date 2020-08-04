@@ -30,6 +30,7 @@
 #define PEAK_BRIGHTNESS   15 // out of 256
 
 /* Utilities */
+#define LED_PIN     13
 #define ONE_SECOND  1000000
 #define WAVE_AMP    255
 
@@ -86,6 +87,9 @@ CRGB fadeTo;
 double fadeFactor[COLOR_LENGTH];
 
 void setup() {
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
   Serial.begin(115200);
 
   // FFT Setup
@@ -111,28 +115,20 @@ void setup() {
 void loop() {
   refreshTime = micros();
   
+  digitalWrite(LED_PIN, HIGH);
   /* Input */
   getSamples();
-
   if (DEBUG_VOLTAGE) {
     plotvRealCentered();
   }
 
   /* FFT */
-  dcRemoval();
-  fft.Windowing(FFT_WIN_TYP_HANN, FFT_FORWARD);
-  fft.Compute(FFT_FORWARD);
-  fft.ComplexToMagnitude();
-
+  computeFFT();
   if (DEBUG_MAG) {
     plotvRealCentered();
   }
 
-  fft.MajorPeak(&peak, &peakMag);
-  if (peakMag < LOWER_BOUND_MAG) {
-    peak = 0;
-  }
-
+  recordPeakFreq();
   if (DEBUG_PEAK) {
     plotPeakFreq();
   }
@@ -141,6 +137,7 @@ void loop() {
     printElapsedTime("Process time");
   }
 
+  digitalWrite(LED_PIN, LOW);
   /* ANIMATION */
   color = getColor(peak);
 
@@ -152,41 +149,15 @@ void loop() {
     fadeTo.nscale8_video(PEAK_BRIGHTNESS);
   }
 
-  for (int i = 0; i < TRANSITION_LENGTH; i++) {
-    memmove(&leds[1], &leds[0], (NUM_LEDS - 1) * sizeof(CRGB));
-
-    if (FADE_TRANSITION) {
-      leds[0] = transitionRGB(fadeFrom, fadeTo, i * (1.0 / TRANSITION_LENGTH));
-    } else {
-      leds[0] = CRGB::Black;
-    }
-    
-    FastLED.show();
-    delay(ANIMATION_DELAY);
-  }
-
-  for (int i = 0; i < COLOR_LENGTH; i++) {
-    memmove(&leds[1], &leds[0], (NUM_LEDS - 1) * sizeof(CRGB));
-    
-    leds[0] = color;
-    if (FADE_COLOR) {
-      leds[0].nscale8(PEAK_BRIGHTNESS * fadeFactor[i]);
-    } else {
-      leds[0].nscale8(PEAK_BRIGHTNESS);
-    }
-
-    FastLED.show();
-    if (i < COLOR_LENGTH - 1) {
-      delay(ANIMATION_DELAY);
-    }
-  }
-
+  animate();
   if (DEBUG_CYCLE_TIME) {
     printElapsedTime("Cycle time");
   }
 
   while (micros() - refreshTime < REFRESH_INTERVAL) {}
 }
+
+/* Processing methods */
 
 void getSamples() {
   for (int i = 0; i < SAMPLES; i++) {
@@ -209,6 +180,22 @@ void dcRemoval() {
     vReal[i] -= vMean;
   }
 }
+
+void computeFFT() {
+  dcRemoval();
+  fft.Windowing(FFT_WIN_TYP_HANN, FFT_FORWARD);
+  fft.Compute(FFT_FORWARD);
+  fft.ComplexToMagnitude();
+}
+
+void recordPeakFreq() {
+  fft.MajorPeak(&peak, &peakMag);
+  if (peakMag < LOWER_BOUND_MAG) {
+    peak = 0;
+  }
+}
+
+/* Animation methods */
 
 int transition(int from, int to, double factor) {
   return round((1 - factor) * from + factor * to);
@@ -239,6 +226,45 @@ CRGB getColor(double freq) {
   // Above range
   return CRGB::Black;
 }
+
+void animateTransition(int frame) {
+  memmove(&leds[1], &leds[0], (NUM_LEDS - 1) * sizeof(CRGB));
+
+  if (FADE_TRANSITION) {
+    leds[0] = transitionRGB(fadeFrom, fadeTo, frame * (1.0 / TRANSITION_LENGTH));
+  } else {
+    leds[0] = CRGB::Black;
+  }
+}
+
+void animateColor(int frame) {
+  memmove(&leds[1], &leds[0], (NUM_LEDS - 1) * sizeof(CRGB));
+
+  leds[0] = color;
+  if (FADE_COLOR) {
+    leds[0].nscale8(PEAK_BRIGHTNESS * fadeFactor[frame]);
+  } else {
+    leds[0].nscale8(PEAK_BRIGHTNESS);
+  }
+}
+
+void animate() {
+  for (int i = 0; i < TRANSITION_LENGTH; i++) {
+    animateTransition(i);
+    FastLED.show();
+    delay(ANIMATION_DELAY);
+  }
+
+  for (int i = 0; i < COLOR_LENGTH; i++) {
+    animateColor(i);
+    FastLED.show();
+    if (i < COLOR_LENGTH - 1) {
+      delay(ANIMATION_DELAY);
+    }
+  }
+}
+
+/* Debug methods */
 
 void plotvRealCentered() {
   int whitespace = (PLOT_WIDTH - (BIN_END - BIN_START + 1)) / 2;
