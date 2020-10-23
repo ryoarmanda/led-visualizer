@@ -15,80 +15,91 @@
 #define LED_TYPE           WS2812B
 #define COLOR_TYPE         GRB
 #define NUM_STRIPS         1
-#define NUM_LEDS_PER_STRIP 300
+#define NUM_LEDS_PER_STRIP 225
 #define NUM_LEDS           NUM_STRIPS * NUM_LEDS_PER_STRIP
 
 /* Animation Settings */
 #define REFRESH_INTERVAL  0 // microseconds
 #define LOWER_BOUND_MAG   80.0
+#define UPPER_BOUND_MAG   30000.0
 #define TRANSITION_LENGTH 3
 #define COLOR_LENGTH      7
-#define ANIMATION_TIME    30 // milliseconds
-#define ANIMATION_DELAY   round(ANIMATION_TIME / (TRANSITION_LENGTH + COLOR_LENGTH))
-#define FADE_TRANSITION   true
+#define ANIMATION_LENGTH  COLOR_LENGTH + TRANSITION_LENGTH
+#define ANIMATION_TIME    50  // milliseconds
+#define ANIMATION_DELAY   round(ANIMATION_TIME / ANIMATION_LENGTH)
 #define FADE_COLOR        false
-#define PEAK_BRIGHTNESS   15 // out of 256
+#define TRANSITION_COLOR  true
+#define FADE_TRANSITION   false
+#define BASE_BRIGHTNESS   16 // out of 256
+#define PEAK_BRIGHTNESS   32 // out of 256
+#define MAX_BRIGHTNESS    255
+
+/* Color Breakpoints */
+
+#define COLOR_BREAKPOINTS 5
+#define FREQ_START        20 
+#define FREQ_END          SAMPLING_RATE / 2
+
+typedef struct {
+  int freq;
+  CRGB color;
+  double freqLog;
+} ColorBreakpoint;
+
+ColorBreakpoint colors[COLOR_BREAKPOINTS] = {
+  {FREQ_START, CHSV(17, 245, 255), 0}, //orange
+  {200, CHSV(0, 247, 255), 0}, //red
+  {1500, CHSV(208, 214, 255), 0}, //violet
+  {3000, CHSV(145, 217, 255), 0}, //blue
+  {FREQ_END, CHSV(111, 237, 255), 0}, //pastel green
+};
 
 /* Utilities */
-#define LED_PIN     13
-#define ONE_SECOND  1000000
-#define WAVE_AMP    255
+#define STATUS_LED_PIN 13
+#define ONE_SECOND     1000000
 
 /* Debug */
 #define PLOT_WIDTH  500
 #define BIN_START   2                // zero-based
 #define BIN_END     SAMPLES / 2 - 1  // zero-based
 
-#define DEBUG_VOLTAGE      false
+#define DEBUG_VOLTAGE      true
 #define DEBUG_MAG          false
 #define DEBUG_PEAK         false
+#define DEBUG_PEAK_MAG     false
 #define DEBUG_PROCESS_TIME false
 #define DEBUG_CYCLE_TIME   false
 
-/* Color Breakpoints */
-
-#define COLOR_BREAKPOINTS 5
-#define FREQ_START        30 
-#define FREQ_END          SAMPLING_RATE / 2
-
-typedef struct {
-  int freq;
-  CRGB color;
-  double freqLogged;
-} ColorBreakpoint;
-
-ColorBreakpoint colors[COLOR_BREAKPOINTS] = {
-  {FREQ_START, CHSV(0, 0, 0), 0},
-  {150, CHSV(0, 247, 255), 0},
-  {1000, CHSV(208, 214, 255), 0},
-  {2000, CHSV(145, 217, 255), 0},
-  {FREQ_END, CHSV(0, 0, 255), 0},
-};
-
 /* General */
 unsigned long refreshTime;    // microseconds
+int i, j;
 
 /* Audio */
 unsigned long samplingPeriod; // microseconds
 unsigned long samplingTime;   // microseconds
 double vReal[SAMPLES];
 double vImag[SAMPLES];
+double vMean;
 arduinoFFT fft;
 double peak;
 double peakMag;
 
 /* LED */
+CRGB rawLeds[NUM_LEDS + ANIMATION_LENGTH];
 CRGB leds[NUM_LEDS];
 CRGB color;
 
 /* Animation */
-CRGB fadeFrom;
-CRGB fadeTo;
-double fadeFactor[COLOR_LENGTH];
+CRGB prevColor;
+double colorFadeFactor[COLOR_LENGTH];
+double transFadeFactor[COLOR_LENGTH];
+int luma = 0;
+int nextLuma = 0;
+int deltaLuma;
 
 void setup() {
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
+  pinMode(STATUS_LED_PIN, OUTPUT);
+  digitalWrite(STATUS_LED_PIN, LOW);
 
   Serial.begin(115200);
 
@@ -103,19 +114,23 @@ void setup() {
   FastLED.show();
 
   // Animation Setup
-  for (int i = 0; i < COLOR_LENGTH; i++) {
-    fadeFactor[i] = cubicwave8(round((i + 1) * WAVE_AMP * (1.0 / (COLOR_LENGTH + 1)))) * (1.0 / WAVE_AMP);
+  for (i = 0; i < COLOR_LENGTH; i++) {
+    colorFadeFactor[i] = cubicwave8(round((i + 1) * MAX_BRIGHTNESS * (1.0 / (COLOR_LENGTH + 1)))) * (1.0 / MAX_BRIGHTNESS);
   }
 
-  for (int i = 0; i < COLOR_BREAKPOINTS; i++) {
-    colors[i].freqLogged = log10(colors[i].freq);
+  for (i = 0; i < TRANSITION_LENGTH; i++) {
+    transFadeFactor[i] = cubicwave8(round((i + 1) * MAX_BRIGHTNESS * (1.0 / (TRANSITION_LENGTH + 1)))) * (1.0 / MAX_BRIGHTNESS);
+  }
+
+  for (i = 0; i < COLOR_BREAKPOINTS; i++) {
+    colors[i].freqLog = log(colors[i].freq);
   }
 }
 
 void loop() {
   refreshTime = micros();
   
-  digitalWrite(LED_PIN, HIGH);
+  digitalWrite(STATUS_LED_PIN, HIGH);
   /* Input */
   getSamples();
   if (DEBUG_VOLTAGE) {
@@ -132,23 +147,18 @@ void loop() {
   if (DEBUG_PEAK) {
     plotPeakFreq();
   }
+  if (DEBUG_PEAK_MAG) {
+    plotPeakMag();
+  }
 
   if (DEBUG_PROCESS_TIME) {
     printElapsedTime("Process time");
   }
 
-  digitalWrite(LED_PIN, LOW);
-  /* ANIMATION */
-  color = getColor(peak);
-
-  fadeFrom = leds[0];
-  fadeTo = color;
-  if (FADE_COLOR) {
-    fadeTo.nscale8_video(PEAK_BRIGHTNESS * fadeFactor[0]);
-  } else {
-    fadeTo.nscale8_video(PEAK_BRIGHTNESS);
-  }
-
+  digitalWrite(STATUS_LED_PIN, LOW);
+  /* Animation */
+  prepColors();
+  prepLuma();
   animate();
   if (DEBUG_CYCLE_TIME) {
     printElapsedTime("Cycle time");
@@ -160,7 +170,7 @@ void loop() {
 /* Processing methods */
 
 void getSamples() {
-  for (int i = 0; i < SAMPLES; i++) {
+  for (i = 0; i < SAMPLES; i++) {
     samplingTime = micros();
 
     vReal[i] = analogRead(AUDIO_IN);
@@ -171,12 +181,12 @@ void getSamples() {
 }
 
 void dcRemoval() {
-  double vMean = 0;
-  for (int i = 0; i < SAMPLES; i++) {
+  vMean = 0;
+  for (i = 0; i < SAMPLES; i++) {
     vMean += vReal[i];
   }
   vMean /= SAMPLES;
-  for (int i = 0; i < SAMPLES; i++) {
+  for (i = 0; i < SAMPLES; i++) {
     vReal[i] -= vMean;
   }
 }
@@ -216,9 +226,9 @@ CRGB getColor(double freq) {
   }
 
   // In range
-  for (int i = 1; i < COLOR_BREAKPOINTS; i++) {
+  for (i = 1; i < COLOR_BREAKPOINTS; i++) {
     if (freq <= colors[i].freq) {
-      double factor = (freq - colors[i - 1].freq) * (1.0 / (colors[i].freq - colors[i - 1].freq));
+      double factor = (log(freq) - colors[i - 1].freqLog) / (colors[i].freqLog - colors[i - 1].freqLog);
       return transitionRGB(colors[i - 1].color, colors[i].color, factor);
     }
   }
@@ -227,38 +237,73 @@ CRGB getColor(double freq) {
   return CRGB::Black;
 }
 
-void animateTransition(int frame) {
-  memmove(&leds[1], &leds[0], (NUM_LEDS - 1) * sizeof(CRGB));
+void prepColors() {
+  prevColor = rawLeds[0]; // Design: First LED is always the previous base color
+  color = getColor(peak);
 
-  if (FADE_TRANSITION) {
-    leds[0] = transitionRGB(fadeFrom, fadeTo, frame * (1.0 / TRANSITION_LENGTH));
-  } else {
-    leds[0] = CRGB::Black;
+  memmove(&rawLeds[ANIMATION_LENGTH], &rawLeds[0], NUM_LEDS * sizeof(CRGB));
+
+  for (i = 0; i < ANIMATION_LENGTH; i++) {
+    if (i < COLOR_LENGTH) {
+      rawLeds[i] = color;
+      if (FADE_COLOR) {
+        rawLeds[i].nscale8(PEAK_BRIGHTNESS * colorFadeFactor[i]); // TODO: Change brightness
+      }
+    } else {
+      rawLeds[i] = CRGB::Black;
+      if (TRANSITION_COLOR) {
+        rawLeds[i] = transitionRGB(color, prevColor, (i - COLOR_LENGTH) * (1.0 / TRANSITION_LENGTH));
+        if (FADE_TRANSITION) {
+          rawLeds[i].nscale8(PEAK_BRIGHTNESS * transFadeFactor[i]); // TODO: Change brightness
+        }
+      }
+    }
   }
 }
 
-void animateColor(int frame) {
-  memmove(&leds[1], &leds[0], (NUM_LEDS - 1) * sizeof(CRGB));
-
-  leds[0] = color;
-  if (FADE_COLOR) {
-    leds[0].nscale8(PEAK_BRIGHTNESS * fadeFactor[frame]);
+void prepLuma() {
+//  luma = BASE_BRIGHTNESS;
+  if (peakMag < LOWER_BOUND_MAG) {
+    nextLuma = 0;
+  } else if (peakMag > UPPER_BOUND_MAG) {
+    nextLuma = PEAK_BRIGHTNESS;
   } else {
-    leds[0].nscale8(PEAK_BRIGHTNESS);
+    nextLuma = round(
+      (PEAK_BRIGHTNESS - BASE_BRIGHTNESS)
+//      * ((peakMag - LOWER_BOUND_MAG) / (UPPER_BOUND_MAG - LOWER_BOUND_MAG))
+      * (log(peakMag - LOWER_BOUND_MAG + 1) / log(UPPER_BOUND_MAG - LOWER_BOUND_MAG + 1))
+      + BASE_BRIGHTNESS
+    );
   }
 }
 
 void animate() {
-  for (int i = 0; i < TRANSITION_LENGTH; i++) {
-    animateTransition(i);
-    FastLED.show();
-    delay(ANIMATION_DELAY);
-  }
+  deltaLuma = (nextLuma - luma) / int(ANIMATION_LENGTH / 2);
 
-  for (int i = 0; i < COLOR_LENGTH; i++) {
-    animateColor(i);
+  for (i = 0; i < ANIMATION_LENGTH; i++) {
+    luma += deltaLuma;
+    if (i == ANIMATION_LENGTH - 1) {
+      // Last frame uses exact next luma
+      luma = nextLuma;
+    }
+
+//    if (i < (int(ANIMATION_LENGTH) / 2 - 1)) {
+//      luma += deltaLuma;
+//    } else if (i > (int(ANIMATION_LENGTH) / 2)) {
+//      luma -= deltaLuma;
+//    } else {
+//      luma = nextLuma;
+//    }
+    
+    for (j = 0; j < NUM_LEDS; j++) {
+      leds[j] = rawLeds[j + int(ANIMATION_LENGTH) - i - 1];
+      leds[j].nscale8(luma);
+    }
+
     FastLED.show();
-    if (i < COLOR_LENGTH - 1) {
+
+    if (i < (int(ANIMATION_LENGTH) - 1)) {
+      // Every frame before last needs delay
       delay(ANIMATION_DELAY);
     }
   }
@@ -268,7 +313,7 @@ void animate() {
 
 void plotvRealCentered() {
   int whitespace = (PLOT_WIDTH - (BIN_END - BIN_START + 1)) / 2;
-  for (int i = 0; i < PLOT_WIDTH; i++) {
+  for (i = 0; i < PLOT_WIDTH; i++) {
     if (DEBUG_MAG) {
       Serial.print(LOWER_BOUND_MAG);
       Serial.print(" ");
@@ -283,12 +328,16 @@ void plotvRealCentered() {
 }
 
 void plotPeakFreq() {
-  for (int i = 0; i < COLOR_BREAKPOINTS; i++) {
+  for (i = 0; i < COLOR_BREAKPOINTS; i++) {
     Serial.print(colors[i].freq);
     Serial.print(" ");
   }
 
   Serial.println(peak);
+}
+
+void plotPeakMag() {
+  Serial.println(peakMag);
 }
 
 void printElapsedTime(char *header) {
