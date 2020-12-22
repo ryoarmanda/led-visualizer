@@ -1,6 +1,6 @@
-# LED Visualizer
+# VibeLight
 
-This repo contains my personal project code for visualizing music through the usage
+VibeLight is my personal project on visualizing music through the usage
 of Fast Fourier Transform (FFT) and individually addressable LEDs.
 
 ## `LinearMusicStrip`
