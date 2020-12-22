@@ -4,7 +4,7 @@
 // --- Macros ---
 
 /* FFT Essentials */
-#define AUDIO_IN         15
+#define AUDIO_IN         14
 #define SAMPLES          512    // power of 2
 #define SAMPLING_RATE    10000   // Hz
 #define REFRESH_INTERVAL 0  // microseconds
@@ -28,7 +28,7 @@
 #define BIN_END       SAMPLES / 2 - 1
 
 /* LED Essentials */
-#define DATA_OUT           7
+#define DATA_OUT           17
 #define LED_TYPE           WS2812B
 #define COLOR_TYPE         GRB
 #define NUM_STRIPS         1
